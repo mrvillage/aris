@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    io::Read,
+    io::{Read, Write},
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
@@ -11,10 +11,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use casus::{Event, Waiter};
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
-use flate2::{
-    read::{ZlibDecoder, ZlibEncoder},
-    Compression,
-};
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use hmac::{Hmac, Mac};
 use rand::distributions::DistString;
 use serde::{Deserialize, Serialize};
@@ -97,8 +94,10 @@ where
     pub async fn connect(&self, send: E) -> Result<Socket<S, E, L>> {
         let socket = Socket::new(self.clone(), send)?;
         self.sockets.insert((*socket.id).clone(), socket.clone());
+        println!("sending hello");
         socket.hello().await?;
-        socket.clone().start_heartbeat_watchdog().await;
+        println!("hello sent");
+        socket.clone().start_heartbeat_watchdog();
         Ok(socket)
     }
 
@@ -118,7 +117,6 @@ where
                         msg,
                         self.should_compress,
                         i.socket.send_adapter.clone(),
-                        i.socket.encoder.clone(),
                     ))
                 })
                 .collect();
@@ -135,8 +133,6 @@ pub enum Msg {
     Text(String),
     Binary(Vec<u8>),
 }
-
-type Encoder = Arc<Mutex<ZlibEncoder<ZlibVec>>>;
 
 #[derive(Debug)]
 struct ZlibVec(Vec<u8>);
@@ -183,7 +179,6 @@ where
     subscriptions: Arc<DashMap<String, ServerSubscription<S, E, L>>>,
     send_adapter: Arc<E>,
     last_heartbeat: Arc<Mutex<u64>>,
-    encoder: Encoder,
     is_closed: Arc<Mutex<bool>>,
 }
 
@@ -200,10 +195,6 @@ where
             subscriptions: Arc::new(DashMap::new()),
             send_adapter: Arc::new(send_adapter),
             last_heartbeat: Arc::new(Mutex::new(now()?)),
-            encoder: Arc::new(Mutex::new(ZlibEncoder::new(
-                vec![].into(),
-                Compression::default(),
-            ))),
             is_closed: Arc::new(Mutex::new(false)),
         })
     }
@@ -263,25 +254,18 @@ where
     }
 
     pub(crate) async fn send(&self, msg: ServerMessage) -> Result<()> {
-        Self::send_pieces(
-            msg,
-            self.server.should_compress,
-            self.send_adapter.clone(),
-            self.encoder.clone(),
-        )
-        .await
+        Self::send_pieces(msg, self.server.should_compress, self.send_adapter.clone()).await
     }
 
     pub(crate) async fn send_pieces(
         msg: ServerMessage,
         should_compress: bool,
         send_adapter: Arc<E>,
-        encoder: Encoder,
     ) -> Result<()> {
         let msg = serde_json::to_string(&msg)?;
         if should_compress {
             send_adapter
-                .send(Msg::Binary(Self::compress_pieces(msg, encoder)?))
+                .send(Msg::Binary(Self::compress_pieces(msg)?))
                 .await
         } else {
             send_adapter.send(Msg::Text(msg)).await
@@ -301,12 +285,10 @@ where
         Ok(())
     }
 
-    pub(crate) fn compress_pieces(text: String, encoder: Encoder) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut g = encoder.lock().unwrap();
-        g.reset(text.into());
-        g.read_to_end(&mut buf)?;
-        Ok(buf)
+    pub(crate) fn compress_pieces(text: String) -> Result<Vec<u8>> {
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(text.as_bytes())?;
+        Ok(e.finish()?)
     }
 
     pub(crate) async fn hello(&self) -> Result<()> {
@@ -399,7 +381,7 @@ where
         }
     }
 
-    async fn start_heartbeat_watchdog(mut self) {
+    fn start_heartbeat_watchdog(mut self) {
         S::spawn(async move {
             loop {
                 let now = now().unwrap();
@@ -408,12 +390,14 @@ where
                         + (self.server.heartbeat_interval as u64)
                         + 2
                 };
-                if now > next_heartbeat {
+                if now >= next_heartbeat {
                     let _ = self
                         .send_adapter
                         .close(4001, Some("Heartbeat timed out"))
                         .await;
                     self.closed(4001, Some("Heartbeat timed out"));
+                } else {
+                    L::sleep(next_heartbeat - now).await;
                 }
             }
         });
@@ -516,7 +500,6 @@ where
     E: ClientSendAdapter + 'static,
     L: SleepAdapter + 'static,
 {
-    decoder: Arc<Mutex<ZlibDecoder<ZlibVec>>>,
     spawn_adapter: PhantomData<S>,
     send_adapter: Arc<E>,
     sleep_adapter: PhantomData<L>,
@@ -534,9 +517,8 @@ where
     E: ClientSendAdapter + 'static,
     L: SleepAdapter + 'static,
 {
-    pub fn new(_spawn_adapter: S, send_adapter: E, _sleep_adapterr: E) -> Self {
+    pub fn new(_spawn_adapter: S, send_adapter: E, _sleep_adapter: L) -> Self {
         Self {
-            decoder: Arc::new(Mutex::new(ZlibDecoder::new(vec![].into()))),
             spawn_adapter: PhantomData,
             send_adapter: Arc::new(send_adapter),
             sleep_adapter: PhantomData,
@@ -551,7 +533,7 @@ where
 
     pub async fn handle_message(&self, msg: Msg) -> Result<()> {
         let msg = serde_json::from_str::<ServerMessage>(&match msg {
-            Msg::Binary(b) => self.decompress(b)?,
+            Msg::Binary(b) => self.decompress(&b)?,
             Msg::Text(t) => t,
         })?;
         match msg.op {
@@ -594,12 +576,11 @@ where
         }
     }
 
-    pub(crate) fn decompress(&self, bytes: Vec<u8>) -> Result<String> {
-        let mut buf = String::new();
-        let mut g = self.decoder.lock().unwrap();
-        g.reset(bytes.into());
-        g.read_to_string(&mut buf)?;
-        Ok(buf)
+    pub(crate) fn decompress(&self, bytes: &[u8]) -> Result<String> {
+        let mut d = ZlibDecoder::new(bytes);
+        let mut s = String::new();
+        d.read_to_string(&mut s)?;
+        Ok(s)
     }
 
     pub async fn subscribe(
